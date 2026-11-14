@@ -69,6 +69,8 @@ final class RecorderController: ObservableObject {
 
     /// Shows an alert (the app delegate decides between a sheet and a standalone alert).
     var onAlert: ((AlertInfo) -> Void)?
+    /// Opens the area picker on the selected display (the app delegate owns the overlay window).
+    var onSelectArea: (() -> Void)?
 
     // MARK: Engine
 
@@ -122,9 +124,12 @@ final class RecorderController: ObservableObject {
     }
 
     func refreshPermissions() {
+        let oldCamera = cameraPermission
         screenPermission = system.status(.screenRecording)
         cameraPermission = system.status(.camera)
         microphonePermission = system.status(.microphone)
+        // In portrait the camera decides the screen slot, and so the area and the capture size.
+        if cameraPermission != oldCamera { scheduleCaptureApply() }
     }
 
     /// "Grant access" in the onboarding.
@@ -263,11 +268,12 @@ final class RecorderController: ObservableObject {
     private func refreshDevices(applyChanges: Bool) {
         let oldCamera = effectiveCameraID
         let oldMic = effectiveMicrophoneID
+        let oldCameraShown = cameraWillShow
         cameras = camera.devices()
         microphones = system.microphones()
         guard applyChanges else { return }
         if oldCamera != effectiveCameraID { applyCamera() }
-        if oldMic != effectiveMicrophoneID { scheduleCaptureApply() }
+        if oldMic != effectiveMicrophoneID || oldCameraShown != cameraWillShow { scheduleCaptureApply() }
     }
 
     func refreshContent(force: Bool = false, reloadThumbnails: Bool = false) async {
@@ -294,6 +300,14 @@ final class RecorderController: ObservableObject {
         }
         reconcileSelection()
         loadThumbnails(reload: reloadThumbnails)
+        // Display sizes may have changed: the area and the capture size follow.
+        scheduleCaptureApply()
+    }
+
+    /// Displays were added, removed or changed resolution.
+    func screensDidChange() {
+        guard sessionStarted else { return }
+        Task { await refreshContent(force: true) }
     }
 
     /// Keeps the selected source valid. A window that disappeared while idle falls back to the main display.
@@ -452,7 +466,7 @@ final class RecorderController: ObservableObject {
 
     private func applyPipeline() {
         guard sessionStarted, state.allowsOutputChanges || appliedPipeline == nil else { return }
-        let size = settings.output.resolution.size
+        let size = settings.output.canvasSize
         let fps = settings.output.fps
         if let applied = appliedPipeline, applied.size == size, applied.fps == fps { return }
         pipeline.start(canvasSize: size, fps: fps)
@@ -492,8 +506,12 @@ final class RecorderController: ObservableObject {
     }
 
     /// The screen content rect on the canvas: no need to capture more pixels than that.
+    /// Portrait: the screen slot of `PortraitLayout`.
     private var captureMaxPixelSize: CGSize {
-        let canvas = settings.output.resolution.size
+        if let slot = portraitSlots?.screen {
+            return CGSize(width: max(2, slot.width.rounded()), height: max(2, slot.height.rounded()))
+        }
+        let canvas = settings.output.canvasSize
         let inset = settings.style.padding * canvas.height
         let w = max(2, (canvas.width - 2 * inset).rounded(.up))
         let h = max(2, (canvas.height - 2 * inset).rounded(.up))
@@ -507,7 +525,8 @@ final class RecorderController: ObservableObject {
             maxPixelSize: captureMaxPixelSize,
             showsCursor: settings.showsCursor,
             capturesSystemAudio: settings.capturesSystemAudio,
-            microphoneID: effectiveMicrophoneID
+            microphoneID: effectiveMicrophoneID,
+            cropRect: effectiveArea
         )
     }
 
@@ -573,6 +592,105 @@ final class RecorderController: ObservableObject {
                 await camera.stop()
             }
         }
+    }
+
+    // MARK: - Canvas and area
+
+    var isPortrait: Bool { settings.output.format == .portrait }
+
+    /// Whether the compositor will draw a camera card (the camera is on and can deliver frames).
+    var cameraWillShow: Bool {
+        settings.style.camera.enabled && cameraPermission == .granted && !cameras.isEmpty
+    }
+
+    /// Portrait canvas slots for the current style and camera state. `nil` on a landscape canvas.
+    var portraitSlots: PortraitLayout.Slots? {
+        guard isPortrait else { return nil }
+        return PortraitLayout.slots(canvasSize: settings.output.canvasSize, style: settings.style, cameraVisible: cameraWillShow)
+    }
+
+    /// Portrait: the area aspect ratio is locked to the screen slot (width / height), so the area fills it.
+    var areaAspectLock: CGFloat? {
+        guard let slot = portraitSlots?.screen, slot.height > 0 else { return nil }
+        return slot.width / slot.height
+    }
+
+    /// The selected display when the source is a display.
+    var selectedDisplay: DisplayInfo? {
+        guard case .display(let id) = currentSource else { return nil }
+        return content.displays.first { $0.id == id }
+    }
+
+    private func areaKey(_ id: UInt32) -> String { String(id) }
+
+    /// The saved area of the selected display (enabled or not).
+    var savedArea: DisplayArea? {
+        guard let display = selectedDisplay else { return nil }
+        return settings.displayAreas[areaKey(display.id)]
+    }
+
+    /// "Custom area" is chosen for the selected display.
+    var usesCustomArea: Bool { savedArea?.enabled == true }
+
+    /// The display area that is captured: points, relative to the display, origin top-left. `nil` = the whole
+    /// display (landscape without a custom area) or a window source.
+    /// Portrait without a custom area uses the largest centered area of the slot aspect.
+    var effectiveArea: CGRect? {
+        guard let display = selectedDisplay else { return nil }
+        let size = display.frame.size
+        guard size.width >= AreaGeometry.minimumSide, size.height >= AreaGeometry.minimumSide else { return nil }
+        let aspect = areaAspectLock
+        if let saved = savedArea, saved.enabled {
+            return AreaGeometry.effectiveArea(saved: saved.rect, aspect: aspect, in: size)
+        }
+        if let aspect {
+            return AreaGeometry.defaultArea(aspect: aspect, in: size)
+        }
+        return nil
+    }
+
+    /// True when portrait records the automatic centered area (no custom area chosen).
+    var usesAutomaticArea: Bool {
+        isPortrait && selectedDisplay != nil && !usesCustomArea
+    }
+
+    /// The area to start the picker with: the active area, else the last saved one.
+    var pickerInitialArea: CGRect? {
+        if let area = effectiveArea { return area }
+        guard let display = selectedDisplay, let saved = savedArea else { return nil }
+        return AreaGeometry.effectiveArea(saved: saved.rect, aspect: areaAspectLock, in: display.frame.size)
+    }
+
+    /// "Full display" (or "Centered" in portrait) vs "Custom area". Custom without a saved area opens the picker.
+    func setUsesCustomArea(_ custom: Bool) {
+        guard state.allowsOutputChanges, let display = selectedDisplay else { return }
+        let key = areaKey(display.id)
+        if custom {
+            if var saved = settings.displayAreas[key] {
+                saved.enabled = true
+                settings.displayAreas[key] = saved
+            } else {
+                selectArea()
+            }
+        } else if settings.displayAreas[key]?.enabled == true {
+            settings.displayAreas[key]?.enabled = false
+        }
+    }
+
+    /// "Select area…": opens the picker overlay on the selected display.
+    func selectArea() {
+        guard state.allowsOutputChanges, sessionStarted, selectedDisplay != nil else { return }
+        onSelectArea?()
+    }
+
+    var canSelectArea: Bool { state.allowsOutputChanges && sessionStarted && selectedDisplay != nil }
+
+    /// The picker confirmed an area (display points, top-left origin) on `displayID`.
+    func applyPickedArea(_ rect: CGRect, displayID: UInt32) {
+        let rounded = CGRect(x: rect.minX.rounded(), y: rect.minY.rounded(), width: rect.width.rounded(), height: rect.height.rounded())
+        let area = DisplayArea(rect: rounded, enabled: true)
+        guard area.isValid else { return }
+        settings.displayAreas[areaKey(displayID)] = area
     }
 
     // MARK: - Persistence
@@ -649,7 +767,7 @@ final class RecorderController: ObservableObject {
         let output = settings.output
         let config = RecordingConfig(
             outputURL: url,
-            canvasSize: output.resolution.size,
+            canvasSize: output.canvasSize,
             fps: output.fps,
             codec: output.codec,
             hasSystemAudio: appliedCapture?.capturesSystemAudio ?? settings.capturesSystemAudio,

@@ -31,7 +31,15 @@ struct CanvasLayout: Equatable {
         var cornerRadius: CGFloat
         var mirrored: Bool
         var shadow: Shadow
+        /// 0 = no border (portrait with padding 0).
         var borderWidth: CGFloat
+        /// Portrait: the camera card sits next to the screen card (no overlap), so its shadow is baked into the
+        /// static background layer, under both cards. Landscape: the bubble overlaps the screen, so its shadow is
+        /// drawn over the screen content.
+        var shadowInBackground: Bool = false
+        /// Portrait: when the crop cuts the source vertically, cut at most this fraction of the source height
+        /// from the top (the rest from the bottom), so a face is not cut. `nil` = centered crop.
+        var maxTopCrop: CGFloat? = nil
     }
 
     var canvas: CGSize
@@ -54,6 +62,9 @@ struct CanvasLayout: Equatable {
     ///   - screenContentSize: pixel size of the useful screen content, `nil` when there is no screen frame.
     ///   - cameraVisible: a fresh camera frame exists and the camera is enabled.
     static func make(canvas: CGSize, style: StyleSettings, screenContentSize: CGSize?, cameraVisible: Bool) -> CanvasLayout {
+        if isPortrait(canvas) {
+            return makePortrait(canvas: canvas, style: style, screenContentSize: screenContentSize, cameraVisible: cameraVisible)
+        }
         let W = canvas.width
         let H = canvas.height
         let shadowStrength = CGFloat(clamp(style.shadow, 0, 1))
@@ -109,6 +120,57 @@ struct CanvasLayout: Equatable {
         return CanvasLayout(canvas: canvas, screen: screen, camera: camera)
     }
 
+    /// A canvas is portrait when it is taller than wide.
+    static func isPortrait(_ canvas: CGSize) -> Bool { canvas.height > canvas.width }
+
+    /// Fraction of the camera source height the portrait crop may cut from the top.
+    static let portraitMaxTopCrop: CGFloat = 0.08
+
+    /// Portrait (9:16): screen card in the top slot, camera card in the bottom slot. The slots come from
+    /// `PortraitLayout` in Core (shared with the UI); everything else (shadow, hairline, border) is the landscape
+    /// look with the canvas WIDTH as the reference length.
+    private static func makePortrait(canvas: CGSize, style: StyleSettings, screenContentSize: CGSize?, cameraVisible: Bool) -> CanvasLayout {
+        let W = canvas.width
+        let H = canvas.height
+        guard W >= 2, H >= 2 else { return CanvasLayout(canvas: canvas, screen: nil, camera: nil) }
+        let slots = PortraitLayout.slots(canvasSize: canvas, style: style, cameraVisible: cameraVisible)
+        // Padding 0 = the screen slot touches the canvas edge: no cards, no radius, no shadow, no lines.
+        let isCard = slots.screen.minX >= 1
+        let shadowStrength = CGFloat(clamp(style.shadow, 0, 1))
+        let shadow = isCard
+            ? Shadow(blur: shadowBlur * W, offset: shadowOffset * W, opacity: shadowStrength * shadowOpacityFactor)
+            : Shadow(blur: 0, offset: 0, opacity: 0)
+        let lineScale = W / 1440
+
+        var screen: Screen?
+        if let content = screenContentSize, content.width >= 1, content.height >= 1,
+           slots.screen.width >= 1, slots.screen.height >= 1 {
+            let fit = aspectFit(content, in: slots.screen)
+            screen = Screen(
+                rect: fit,
+                cornerRadius: isCard ? min(max(0, slots.cornerRadius), min(fit.width, fit.height) / 2) : 0,
+                isCard: isCard,
+                shadow: shadow,
+                hairlineWidth: max(1, (hairlineAt1440 * lineScale).rounded())
+            )
+        }
+
+        var camera: Camera?
+        if let slot = slots.camera, slot.width >= 1, slot.height >= 1 {
+            camera = Camera(
+                rect: slot,
+                shape: .roundedRect,
+                cornerRadius: isCard ? min(max(0, slots.cornerRadius), min(slot.width, slot.height) / 2) : 0,
+                mirrored: style.camera.mirrored,
+                shadow: shadow,
+                borderWidth: isCard ? max(1, cameraBorderAt1440 * lineScale) : 0,
+                shadowInBackground: true,
+                maxTopCrop: portraitMaxTopCrop
+            )
+        }
+        return CanvasLayout(canvas: canvas, screen: screen, camera: camera)
+    }
+
     /// Aspect-fit `size` into `area`, centered, snapped to whole pixels.
     static func aspectFit(_ size: CGSize, in area: CGRect) -> CGRect {
         let scale = min(area.width / size.width, area.height / size.height)
@@ -119,8 +181,9 @@ struct CanvasLayout: Equatable {
         return CGRect(x: x, y: y, width: min(w, area.width), height: min(h, area.height))
     }
 
-    /// The centered source crop that aspect-fills `target` with `source`.
-    static func aspectFillCrop(source: CGRect, target: CGSize) -> CGRect {
+    /// The source crop (top-left pixels) that aspect-fills `target` with `source`. Centered, except that a
+    /// vertical crop cuts at most `maxTopCrop × source height` from the top when given (biased upward).
+    static func aspectFillCrop(source: CGRect, target: CGSize, maxTopCrop: CGFloat? = nil) -> CGRect {
         let targetAspect = target.width / target.height
         let sourceAspect = source.width / source.height
         if sourceAspect > targetAspect {
@@ -128,7 +191,11 @@ struct CanvasLayout: Equatable {
             return CGRect(x: source.midX - w / 2, y: source.minY, width: w, height: source.height)
         } else {
             let h = source.width / targetAspect
-            return CGRect(x: source.minX, y: source.midY - h / 2, width: source.width, height: h)
+            guard let maxTopCrop else {
+                return CGRect(x: source.minX, y: source.midY - h / 2, width: source.width, height: h)
+            }
+            let top = min((source.height - h) / 2, max(0, maxTopCrop) * source.height)
+            return CGRect(x: source.minX, y: source.minY + top, width: source.width, height: h)
         }
     }
 

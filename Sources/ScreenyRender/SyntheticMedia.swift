@@ -70,16 +70,28 @@ enum Synthetic {
 
 /// A fake retina app window (2940×1912) with text and moving colored blocks.
 final class SyntheticScreen {
+    enum Layout {
+        /// Wide desktop window with a sidebar, in fixed pixels (designed for 2940×1912, fine down to ~2000 px wide).
+        case desktop
+        /// Narrow window or display area for a portrait canvas (any aspect ratio). Drawn on a 1000 px wide
+        /// reference grid and scaled to the buffer width, so text has the same relative size at any resolution.
+        case narrow
+    }
+
     let width: Int
     let height: Int
+    let layout: Layout
     private let pool: CVPixelBufferPool
     private let base: CGImage
 
-    init(width: Int = 2940, height: Int = 1912) throws {
+    init(width: Int = 2940, height: Int = 1912, layout: Layout = .desktop) throws {
         self.width = width
         self.height = height
-        guard let pool = Synthetic.makePool(width: width, height: height),
-              let base = Self.drawBase(width: width, height: height)
+        self.layout = layout
+        let drawn: CGImage? = layout == .desktop
+            ? Self.drawBase(width: width, height: height)
+            : Self.drawNarrowBase(width: width, height: height)
+        guard let pool = Synthetic.makePool(width: width, height: height), let base = drawn
         else { throw SelfTestError("cannot create the synthetic screen source") }
         self.pool = pool
         self.base = base
@@ -90,12 +102,17 @@ final class SyntheticScreen {
     ///   - marker: draws a large white sync marker (used by the A/V sync check).
     func frame(t: Double, time: CMTime, marker: Bool = false) -> VideoFrame? {
         let base = self.base
+        let narrow = layout == .narrow
         let buffer = Synthetic.drawBuffer(pool: pool) { ctx, size in
             ctx.saveGState()
             ctx.translateBy(x: 0, y: size.height)
             ctx.scaleBy(x: 1, y: -1)
             ctx.draw(base, in: CGRect(origin: .zero, size: size))
             ctx.restoreGState()
+            if narrow {
+                Self.drawNarrowAnimation(ctx, size: size, t: t, marker: marker)
+                return
+            }
 
             // Animated chart area.
             let chart = CGRect(x: 520, y: 1180, width: size.width - 600, height: 560)
@@ -124,6 +141,123 @@ final class SyntheticScreen {
         guard let buffer else { return nil }
         return VideoFrame(pixelBuffer: buffer, contentRect: CGRect(x: 0, y: 0, width: width, height: height), time: time)
     }
+
+    // MARK: Narrow layout (1000 px wide reference grid)
+
+    static let narrowReferenceWidth: CGFloat = 1000
+
+    /// Chart area of the narrow layout in reference units; it takes the space left under the table.
+    private static func narrowChart(referenceHeight: CGFloat) -> CGRect {
+        let top: CGFloat = 790
+        let bottom = max(top + 150, referenceHeight - 36)
+        return CGRect(x: 40, y: top, width: narrowReferenceWidth - 80, height: bottom - top)
+    }
+
+    private static func drawNarrowAnimation(_ ctx: CGContext, size: CGSize, t: Double, marker: Bool) {
+        let s = size.width / narrowReferenceWidth
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.scaleBy(x: s, y: s)
+        let chart = narrowChart(referenceHeight: size.height / s)
+        let colors: [UInt32] = [0xFF5F57, 0x2F80ED, 0x27AE60]
+        let gap: CGFloat = 14
+        let blockHeight = min(120, (chart.height - 48 - 2 * gap) / 3)
+        let stack = 3 * blockHeight + 2 * gap
+        let top = chart.minY + (chart.height - stack) / 2
+        for (i, hex) in colors.enumerated() {
+            let phase = t * (0.35 + 0.12 * Double(i)) + Double(i) * 0.33
+            let u = 0.5 - 0.5 * cos(phase * 2 * .pi)
+            let w: CGFloat = 250
+            let x = chart.minX + 24 + CGFloat(u) * (chart.width - w - 48)
+            let r = CGRect(x: x, y: top + CGFloat(i) * (blockHeight + gap), width: w, height: blockHeight)
+            ctx.setFillColor(Synthetic.color(hex))
+            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 16, cornerHeight: 16, transform: nil))
+            ctx.fillPath()
+            let textSize = min(28, blockHeight * 0.42)
+            Synthetic.text("Block \(i + 1)", in: ctx, x: r.minX + 24, y: r.midY + textSize * 0.36, size: textSize,
+                           weight: .semibold, color: Synthetic.color(0xFFFFFF))
+        }
+        Synthetic.text(String(format: "t = %06.3f s", t), in: ctx, x: narrowReferenceWidth - 210, y: 47, size: 20, mono: true,
+                       color: Synthetic.color(0x6E6E73))
+        if marker {
+            ctx.setFillColor(Synthetic.color(0xFFFFFF))
+            ctx.fill(CGRect(x: 0, y: 76, width: 220, height: size.height / s - 76))
+        }
+    }
+
+    private static func drawNarrowBase(width: Int, height: Int) -> CGImage? {
+        guard width > 0, height > 0, let ctx = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: Synthetic.sRGB,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+        let s = CGFloat(width) / narrowReferenceWidth
+        let W = narrowReferenceWidth
+        let H = CGFloat(height) / s
+        ctx.translateBy(x: 0, y: CGFloat(height))
+        ctx.scaleBy(x: s, y: -s)
+        ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+
+        // Window body and title bar.
+        ctx.setFillColor(Synthetic.color(0xFFFFFF))
+        ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.setFillColor(Synthetic.color(0xECECEE))
+        ctx.fill(CGRect(x: 0, y: 0, width: W, height: 76))
+        ctx.setFillColor(Synthetic.color(0x000000, 0.1))
+        ctx.fill(CGRect(x: 0, y: 75, width: W, height: 1.5))
+        for (i, hex) in [UInt32(0xFF5F57), 0xFEBC2E, 0x28C840].enumerated() {
+            ctx.setFillColor(Synthetic.color(hex))
+            ctx.fillEllipse(in: CGRect(x: 28 + CGFloat(i) * 34, y: 28, width: 20, height: 20))
+        }
+        Synthetic.text("Comakers Workspace", in: ctx, x: 140, y: 47, size: 24, weight: .semibold, color: Synthetic.color(0x1D1D1F))
+
+        Synthetic.text("Automation report", in: ctx, x: 48, y: 152, size: 50, weight: .bold, color: Synthetic.color(0x1D1D1F))
+        let paragraph = [
+            "This synthetic window checks how the compositor",
+            "scales text into a 9:16 canvas. Body text is 28 px,",
+            "the caption is 22 px. Both must stay crisp.",
+        ]
+        for (i, line) in paragraph.enumerated() {
+            Synthetic.text(line, in: ctx, x: 48, y: 208 + CGFloat(i) * 42, size: 28, color: Synthetic.color(0x3A3A3C))
+        }
+        Synthetic.text("350+ automations · pilot in 72 hours · 11 pt caption", in: ctx, x: 48, y: 334, size: 22,
+                       color: Synthetic.color(0x8E8E93))
+
+        let code = CGRect(x: 48, y: 366, width: W - 96, height: 200)
+        ctx.setFillColor(Synthetic.color(0x1E1E2E))
+        ctx.addPath(CGPath(roundedRect: code, cornerWidth: 16, cornerHeight: 16, transform: nil))
+        ctx.fillPath()
+        let codeLines = [
+            ("func compose(frame: VideoFrame) {", UInt32(0xCDD6F4)),
+            ("    let slots = PortraitLayout.slots(…)", 0xA6E3A1),
+            ("    // masks and shadows are cached", 0x7F849C),
+            ("}", 0xCDD6F4),
+        ]
+        for (i, entry) in codeLines.enumerated() {
+            Synthetic.text(entry.0, in: ctx, x: code.minX + 30, y: code.minY + 50 + CGFloat(i) * 42, size: 24, mono: true,
+                           color: Synthetic.color(entry.1))
+        }
+
+        let table = CGRect(x: 48, y: 596, width: W - 96, height: 156)
+        let columns: [CGFloat] = [0, 0.56, 0.8]
+        for row in 0...2 {
+            let y = table.minY + CGFloat(row) * 52
+            ctx.setFillColor(Synthetic.color(0x000000, row == 0 ? 0.25 : 0.08))
+            ctx.fill(CGRect(x: table.minX, y: y + 50, width: table.width, height: 2))
+            let cells = row == 0 ? ["Module", "Status", "Saved"] :
+                [["M1 Lead intake", "Live", "42 h"], ["M3 Support triage", "Pilot", "65 h"]][row - 1]
+            for (c, cell) in cells.enumerated() {
+                Synthetic.text(cell, in: ctx, x: table.minX + columns[c] * table.width, y: y + 36, size: 24,
+                               weight: row == 0 ? .semibold : .regular, color: Synthetic.color(0x1D1D1F))
+            }
+        }
+        let chart = narrowChart(referenceHeight: H)
+        ctx.setFillColor(Synthetic.color(0xF2F2F7))
+        ctx.addPath(CGPath(roundedRect: chart, cornerWidth: 20, cornerHeight: 20, transform: nil))
+        ctx.fillPath()
+        return ctx.makeImage()
+    }
+
+    // MARK: Desktop layout
 
     private static func drawBase(width: Int, height: Int) -> CGImage? {
         guard let ctx = CGContext(

@@ -1,10 +1,13 @@
 import AVFoundation
 import AppKit
+import CoreImage
 import SwiftUI
 
 /// Facts about a finished recording, loaded off the main thread.
 struct RecordingInfo: Equatable {
     var thumbnail: CGImage?
+    /// Blurred thumbnail that fills the sides of the box behind a tall (9:16) video.
+    var backdrop: CGImage?
     var duration: TimeInterval?
     var fileSize: Int64?
     var pixelSize: CGSize?
@@ -25,12 +28,41 @@ struct RecordingInfo: Equatable {
         }
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 960, height: 540)
+        // Square bound: enough for a 16:9 and a 9:16 thumbnail.
+        generator.maximumSize = CGSize(width: 960, height: 960)
         let time = CMTime(seconds: min(0.5, (info.duration ?? 0) / 2), preferredTimescale: 600)
         if let result = try? await generator.image(at: time) {
             info.thumbnail = result.image
+            if result.image.height > result.image.width {
+                info.backdrop = blurred(result.image)
+            }
         }
         return info
+    }
+
+    /// A small, heavily blurred copy (Core Image, so it looks the same in every renderer).
+    private static func blurred(_ image: CGImage) -> CGImage? {
+        let source = CIImage(cgImage: image)
+        guard source.extent.width > 0 else { return nil }
+        let scale = 160 / source.extent.width
+        let small = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let blurred = small.clampedToExtent().applyingGaussianBlur(sigma: 9).cropped(to: small.extent)
+        return CIContext(options: [.cacheIntermediates: false]).createCGImage(blurred, from: small.extent)
+    }
+}
+
+/// 16:9 box for a landscape video; a full-width box of fixed height for a tall (9:16) video.
+private struct ThumbnailFrame: ViewModifier {
+    let isTall: Bool
+
+    func body(content: Content) -> some View {
+        if isTall {
+            content
+                .frame(maxWidth: .infinity)
+                .frame(height: 252)
+        } else {
+            content.aspectRatio(16.0 / 9.0, contentMode: .fit)
+        }
     }
 }
 
@@ -79,6 +111,19 @@ private struct FinishedCard: View {
                 ZStack {
                     Rectangle().fill(Color.black)
                     if let thumbnail = info.thumbnail {
+                        if isTall, let backdrop = info.backdrop {
+                            // A tall video sits in a wide box: fill the sides with a dim, blurred copy.
+                            // Color.clear takes the box size, so the filled copy never grows the layout.
+                            Color.clear
+                                .overlay(
+                                    Image(decorative: backdrop, scale: 1)
+                                        .resizable()
+                                        .interpolation(.high)
+                                        .aspectRatio(contentMode: .fill)
+                                        .opacity(0.45)
+                                )
+                                .clipped()
+                        }
                         Image(decorative: thumbnail, scale: 1)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
@@ -98,7 +143,7 @@ private struct FinishedCard: View {
                                 .offset(x: 2)
                         )
                 }
-                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .modifier(ThumbnailFrame(isTall: isTall))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -180,6 +225,12 @@ private struct FinishedCard: View {
         .task(id: url) {
             info = await RecordingInfo.load(url: url)
         }
+    }
+
+    /// Portrait video. Before the file is read, the current canvas format is the best guess.
+    private var isTall: Bool {
+        if let px = info.pixelSize, px.width > 0, px.height > 0 { return px.height > px.width }
+        return controller.settings.output.format == .portrait
     }
 
     private var details: String {

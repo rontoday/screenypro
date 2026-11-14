@@ -60,7 +60,7 @@ public enum RecorderError: LocalizedError {
     }
 }
 
-/// A failed check of `SelfTest.run(outputURL:)`.
+/// A failed check of `SelfTest.run(outputURL:portrait:)`.
 public struct SelfTestError: LocalizedError {
     public let message: String
 

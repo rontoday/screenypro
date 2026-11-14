@@ -78,6 +78,9 @@ public struct CaptureConfig: Equatable, Sendable {
     public var capturesSystemAudio: Bool
     /// `nil` = do not capture a microphone.
     public var microphoneID: String?
+    /// Only for a `.display` source: capture just this part of the display.
+    /// In points, relative to the display, origin TOP-left. `nil` = the whole display. Ignored for windows.
+    public var cropRect: CGRect?
 
     public init(
         source: CaptureSource,
@@ -85,8 +88,10 @@ public struct CaptureConfig: Equatable, Sendable {
         maxPixelSize: CGSize = CGSize(width: 3840, height: 2160),
         showsCursor: Bool = true,
         capturesSystemAudio: Bool = true,
-        microphoneID: String? = nil
+        microphoneID: String? = nil,
+        cropRect: CGRect? = nil
     ) {
+        self.cropRect = cropRect
         self.source = source
         self.fps = fps
         self.maxPixelSize = maxPixelSize
@@ -184,15 +189,39 @@ public enum VideoCodec: String, Codable, CaseIterable, Sendable {
     case hevc
 }
 
+/// Shape of the output canvas.
+public enum CanvasFormat: String, Codable, CaseIterable, Sendable {
+    /// 16:9, for client screencasts.
+    case landscape
+    /// 9:16, for Reels / Shorts / TikTok. Screen content on top, camera below (see `PortraitLayout`).
+    case portrait
+}
+
 public struct OutputSettings: Codable, Equatable, Sendable {
     public var resolution: OutputResolution
     public var fps: Int
     public var codec: VideoCodec
+    public var format: CanvasFormat
 
-    public init(resolution: OutputResolution = .p1440, fps: Int = 30, codec: VideoCodec = .h264) {
+    public init(resolution: OutputResolution = .p1440, fps: Int = 30, codec: VideoCodec = .h264, format: CanvasFormat = .landscape) {
         self.resolution = resolution
         self.fps = fps
         self.codec = codec
+        self.format = format
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        resolution = try c.decodeIfPresent(OutputResolution.self, forKey: .resolution) ?? .p1440
+        fps = try c.decodeIfPresent(Int.self, forKey: .fps) ?? 30
+        codec = try c.decodeIfPresent(VideoCodec.self, forKey: .codec) ?? .h264
+        format = try c.decodeIfPresent(CanvasFormat.self, forKey: .format) ?? .landscape
+    }
+
+    /// Canvas size in pixels. Portrait swaps width and height (1080p → 1080×1920).
+    public var canvasSize: CGSize {
+        let size = resolution.size
+        return format == .portrait ? CGSize(width: size.height, height: size.width) : size
     }
 }
 

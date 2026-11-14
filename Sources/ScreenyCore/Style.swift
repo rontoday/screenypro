@@ -149,6 +149,20 @@ public struct CameraStyle: Codable, Equatable, Sendable {
     /// Distance from the canvas edges as a fraction of the canvas height.
     public var margin: Double
     public var mirrored: Bool
+    /// Portrait canvas only: height of the camera slot as a fraction of the canvas height (0.25...0.6).
+    /// `corner`, `shape`, `size` and `margin` are ignored on a portrait canvas.
+    public var portraitShare: Double
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        corner = try c.decodeIfPresent(CanvasCorner.self, forKey: .corner) ?? .bottomRight
+        shape = try c.decodeIfPresent(CameraShape.self, forKey: .shape) ?? .roundedRect
+        size = try c.decodeIfPresent(Double.self, forKey: .size) ?? 0.28
+        margin = try c.decodeIfPresent(Double.self, forKey: .margin) ?? 0.03
+        mirrored = try c.decodeIfPresent(Bool.self, forKey: .mirrored) ?? true
+        portraitShare = try c.decodeIfPresent(Double.self, forKey: .portraitShare) ?? 0.42
+    }
 
     public init(
         enabled: Bool = true,
@@ -156,8 +170,10 @@ public struct CameraStyle: Codable, Equatable, Sendable {
         shape: CameraShape = .roundedRect,
         size: Double = 0.28,
         margin: Double = 0.03,
-        mirrored: Bool = true
+        mirrored: Bool = true,
+        portraitShare: Double = 0.42
     ) {
+        self.portraitShare = portraitShare
         self.enabled = enabled
         self.corner = corner
         self.shape = shape
@@ -192,5 +208,39 @@ public struct StyleSettings: Codable, Equatable, Sendable {
         self.cornerRadius = cornerRadius
         self.shadow = shadow
         self.camera = camera
+    }
+}
+
+/// Layout of a portrait (9:16) canvas: screen content in the top slot, camera in the bottom slot.
+/// Shared by the compositor (drawing) and the UI (area aspect ratio, capture size).
+public enum PortraitLayout {
+    public struct Slots: Equatable, Sendable {
+        /// Area for the screen content, canvas pixels, origin TOP-left. The content is aspect-fit and centered in it.
+        public var screen: CGRect
+        /// Area the camera fills (aspect-fill crop). `nil` when the camera is not shown.
+        public var camera: CGRect?
+        /// Corner radius for both cards, in pixels. 0 when `padding == 0`.
+        public var cornerRadius: CGFloat
+    }
+
+    /// All relative style values use the canvas WIDTH as the reference on a portrait canvas.
+    /// - `padding == 0`: the slots touch the canvas edges and each other, no radius.
+    /// - camera not visible: the screen slot is the whole canvas inset by the padding.
+    public static func slots(canvasSize: CGSize, style: StyleSettings, cameraVisible: Bool) -> Slots {
+        let w = canvasSize.width
+        let h = canvasSize.height
+        let pad = (CGFloat(style.padding) * w).rounded()
+        let radius = pad == 0 ? 0 : (CGFloat(style.cornerRadius) * w * 1.6).rounded()
+        guard cameraVisible && style.camera.enabled else {
+            return Slots(screen: CGRect(x: pad, y: pad, width: w - 2 * pad, height: h - 2 * pad), camera: nil, cornerRadius: radius)
+        }
+        let gap = (pad * 0.6).rounded()
+        let share = CGFloat(min(max(style.camera.portraitShare, 0.25), 0.6))
+        let usable = h - 2 * pad - gap
+        let cameraHeight = (usable * share).rounded()
+        let screenHeight = usable - cameraHeight
+        let screen = CGRect(x: pad, y: pad, width: w - 2 * pad, height: screenHeight)
+        let camera = CGRect(x: pad, y: pad + screenHeight + gap, width: w - 2 * pad, height: cameraHeight)
+        return Slots(screen: screen, camera: camera, cornerRadius: radius)
     }
 }

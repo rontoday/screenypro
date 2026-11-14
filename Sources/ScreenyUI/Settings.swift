@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import ScreenyCore
 
@@ -27,13 +28,15 @@ struct AppSettings: Codable, Equatable {
     var solidColor = RGBA(hex: 0x3D4250)
     /// Last background image, so the image swatch keeps it while a gradient is selected.
     var backgroundImage: URL?
+    /// Custom capture area per display, keyed by `CGDirectDisplayID` as a string.
+    var displayAreas: [String: DisplayArea] = [:]
 
     init() {}
 
     private enum CodingKeys: String, CodingKey {
         case style, output, sourceKind, displayID, windowID, windowBundleID, windowTitle
         case cameraDeviceID, microphoneEnabled, microphoneID, capturesSystemAudio, showsCursor
-        case solidColor, backgroundImage
+        case solidColor, backgroundImage, displayAreas
     }
 
     /// Tolerant decoding: a missing or broken key falls back to its default instead of
@@ -55,6 +58,7 @@ struct AppSettings: Codable, Equatable {
         showsCursor = (try? c.decodeIfPresent(Bool.self, forKey: .showsCursor)) ?? d.showsCursor
         solidColor = (try? c.decodeIfPresent(RGBA.self, forKey: .solidColor)) ?? d.solidColor
         backgroundImage = try? c.decodeIfPresent(URL.self, forKey: .backgroundImage)
+        displayAreas = (try? c.decodeIfPresent([String: DisplayArea].self, forKey: .displayAreas)) ?? d.displayAreas
         sanitize()
     }
 
@@ -64,10 +68,25 @@ struct AppSettings: Codable, Equatable {
         style.cornerRadius = min(max(style.cornerRadius, 0), 0.05)
         style.shadow = min(max(style.shadow, 0), 1)
         style.camera.size = min(max(style.camera.size, 0.15), 0.45)
+        style.camera.portraitShare = min(max(style.camera.portraitShare, 0.25), 0.6)
+        displayAreas = displayAreas.filter { $0.value.isValid }
         if output.fps != 30 && output.fps != 60 { output.fps = 30 }
         if case .image(let url) = style.background, !FileManager.default.fileExists(atPath: url.path) {
             style.background = .gradient(GradientPreset.all[0].id)
         }
+    }
+}
+
+/// A custom capture area of one display. `rect` is in points, relative to the display, origin top-left.
+/// `enabled == false` keeps the last area while the display is recorded in full.
+struct DisplayArea: Codable, Equatable {
+    var rect: CGRect
+    var enabled: Bool
+
+    var isValid: Bool {
+        let r = rect.standardized
+        return r.minX.isFinite && r.minY.isFinite && r.width.isFinite && r.height.isFinite
+            && r.width >= AreaGeometry.minimumSide && r.height >= AreaGeometry.minimumSide
     }
 }
 

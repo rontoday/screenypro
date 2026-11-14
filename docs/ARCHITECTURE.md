@@ -84,7 +84,7 @@ Requirements:
 - `public final class FramePipeline: RenderPipeline` — `public init(screen: LatestFrameBox, camera: LatestFrameBox)`
 - `public final class MovieRecorder: Recording` — `public init(config: RecordingConfig)`
 - `public final class PreviewView: NSView, PreviewDisplaying` — `override init(frame:)`
-- `public enum SelfTest { public static func run(outputURL: URL) async throws }`
+- `public enum SelfTest { public static func run(outputURL: URL, portrait: Bool = false) async throws }`
 
 ### Compositor (Core Image on Metal)
 
@@ -229,3 +229,27 @@ swift build --target <YourTarget> --scratch-path .build-<yourname>   # while dev
 scripts/build-app.sh            # full app → build/ScreenyPro.app
 build/ScreenyPro.app/Contents/MacOS/ScreenyPro --selftest /tmp/x.mp4
 ```
+
+## Portrait (9:16) mode for Reels
+
+Second canvas format next to 16:9. `OutputSettings.format == .portrait` → `OutputSettings.canvasSize` is
+1080×1920 / 1440×2560 / 2160×3840. The pipeline and recorder already take any canvas size.
+A canvas is portrait when `height > width`.
+
+Layout comes from `PortraitLayout.slots` in Core (the single source of truth for compositor and UI):
+
+- Background as before, full canvas.
+- **Screen card** in the top slot: aspect-fit, centered in the slot, rounded corners `slots.cornerRadius`,
+  same shadow and hairline as in landscape (sizes relative to canvas WIDTH instead of height).
+- **Camera card** in the bottom slot: aspect-fill crop centered (bias the crop slightly upward so a face is not cut:
+  keep the top 8% margin of the source when cropping vertically is not needed; when cropping horizontally just center),
+  same radius, same shadow, 2 px border at 20% white. Mirrored when `camera.mirrored`.
+  `camera.corner/shape/size/margin` are ignored.
+- `padding == 0`: slots are edge to edge, no radius, no shadow, no gap.
+- Camera off or no camera frame: screen slot = whole canvas inset by the padding.
+
+The whole display is too small in a 9:16 frame, so the user records a **window** or an **area of a display**:
+`CaptureConfig.cropRect` (display points, top-left origin) → `SCStreamConfiguration.sourceRect`.
+The UI offers an area picker (drag a rectangle on the display; in portrait the aspect ratio is locked to the
+screen slot's aspect so the area fills the slot exactly) and shows a thin outline around the chosen area while
+idle and recording (own windows are excluded from display capture, so the outline is never recorded).

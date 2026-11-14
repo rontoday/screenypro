@@ -40,6 +40,8 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
     private var stream: SCStream?
     private var receiver: ScreenStreamReceiver?
     private var activeConfig: CaptureConfig?
+    /// The clamped display area of the running stream (`sourceRect`), `nil` = whole display or a window.
+    private var activeCrop: CGRect?
     private var outputSize: CGSize = .zero
     private var generation = 0
 
@@ -172,7 +174,17 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
         let filter = try Self.makeFilter(for: config.source, in: content)
         let isWindow: Bool
         if case .window = config.source { isWindow = true } else { isWindow = false }
-        let size = Self.fittedSize(Self.nativePixelSize(of: filter), maxPixelSize: config.maxPixelSize)
+
+        // Area of a display: `sourceRect` (display points, top-left origin, like `cropRect`).
+        var crop: CGRect?
+        if case let .display(displayID) = config.source,
+           let cropRect = config.cropRect,
+           let display = content.displays.first(where: { $0.displayID == displayID }) {
+            crop = Self.effectiveCrop(cropRect, displaySize: display.frame.size, scale: Self.pointPixelScale(of: filter))
+        }
+        let native = crop.map { Self.cropPixelSize($0, scale: Self.pointPixelScale(of: filter)) } ?? Self.nativePixelSize(of: filter)
+        let size = Self.fittedSize(native, maxPixelSize: config.maxPixelSize)
+        let cropAspect = crop.map { $0.width / $0.height }
 
         // Update the running stream in place when the audio outputs stay the same.
         if streamAlive, let stream, let receiver, let current = activeConfig, Self.audioOutputsMatch(current, config) {
@@ -180,10 +192,11 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
                 if current.source != config.source {
                     try await stream.updateContentFilter(filter)
                 }
-                try await stream.updateConfiguration(Self.makeStreamConfiguration(config, size: size))
+                try await stream.updateConfiguration(Self.makeStreamConfiguration(config, size: size, sourceRect: crop))
                 activeConfig = config
+                activeCrop = crop
                 outputSize = size
-                receiver.reset(isWindow: isWindow, maxPixelSize: config.maxPixelSize, outputSize: size)
+                receiver.reset(isWindow: isWindow, maxPixelSize: config.maxPixelSize, outputSize: size, cropAspect: cropAspect)
                 return
             } catch {
                 captureLog.error("Live stream update failed, restarting: \(error.localizedDescription, privacy: .public)")
@@ -192,14 +205,14 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
 
         await teardownLocked(clearFrames: false)
         do {
-            try await launchLocked(config: config, filter: filter, isWindow: isWindow, size: size)
+            try await launchLocked(config: config, filter: filter, isWindow: isWindow, size: size, crop: crop)
         } catch {
             frames.set(nil)
             throw CaptureError.wrap(error)
         }
     }
 
-    private func launchLocked(config: CaptureConfig, filter: SCContentFilter, isWindow: Bool, size: CGSize) async throws {
+    private func launchLocked(config: CaptureConfig, filter: SCContentFilter, isWindow: Bool, size: CGSize, crop: CGRect?) async throws {
         generation += 1
         let receiver = ScreenStreamReceiver(
             owner: self,
@@ -207,9 +220,14 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
             frames: frames,
             isWindow: isWindow,
             maxPixelSize: config.maxPixelSize,
-            outputSize: size
+            outputSize: size,
+            cropAspect: crop.map { $0.width / $0.height }
         )
-        let stream = SCStream(filter: filter, configuration: Self.makeStreamConfiguration(config, size: size), delegate: receiver)
+        let stream = SCStream(
+            filter: filter,
+            configuration: Self.makeStreamConfiguration(config, size: size, sourceRect: crop),
+            delegate: receiver
+        )
         do {
             try stream.addStreamOutput(receiver, type: .screen, sampleHandlerQueue: videoQueue)
             if config.capturesSystemAudio {
@@ -226,6 +244,7 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
         self.stream = stream
         self.receiver = receiver
         activeConfig = config
+        activeCrop = crop
         outputSize = size
     }
 
@@ -235,6 +254,7 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
         stream = nil
         receiver = nil
         activeConfig = nil
+        activeCrop = nil
         outputSize = .zero
         guard let oldStream else { return }
         do {
@@ -265,6 +285,7 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
                 self.stream = nil
                 self.receiver = nil
                 self.activeConfig = nil
+                self.activeCrop = nil
                 self.outputSize = .zero
             }
         }
@@ -287,7 +308,7 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
         else { return }
         guard size != outputSize else { return }
         do {
-            try await stream.updateConfiguration(Self.makeStreamConfiguration(config, size: size))
+            try await stream.updateConfiguration(Self.makeStreamConfiguration(config, size: size, sourceRect: activeCrop))
             outputSize = size
             captureLog.debug("Window resized, stream size \(Int(size.width))x\(Int(size.height))")
         } catch {
@@ -348,6 +369,65 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
         }
     }
 
+    /// Smallest display area in points; anything smaller (or empty) means the whole display.
+    static let minimumCropPoints: CGFloat = 64
+
+    static func pointPixelScale(of filter: SCContentFilter) -> CGFloat {
+        CGFloat(filter.pointPixelScale > 0 ? filter.pointPixelScale : 1)
+    }
+
+    /// Clamps a display area (points, top-left origin, relative to the display) into the display and snaps it
+    /// to the pixel grid. A rect that is partly outside is moved in (size kept), a rect larger than the display
+    /// is cut to it. Returns `nil` for an empty or too small area, and for an area that is the whole display.
+    static func effectiveCrop(_ rect: CGRect, displaySize: CGSize, scale: CGFloat) -> CGRect? {
+        let minimum = minimumCropPoints
+        guard displaySize.width >= minimum, displaySize.height >= minimum else { return nil }
+        let r = rect.standardized
+        guard !r.isNull, !r.isInfinite,
+              r.minX.isFinite, r.minY.isFinite, r.width.isFinite, r.height.isFinite,
+              r.width >= minimum, r.height >= minimum
+        else { return nil }
+        let s = max(scale, 1)
+        func snap(_ v: CGFloat) -> CGFloat { (v * s).rounded() / s }
+        let width = snap(min(r.width, displaySize.width))
+        let height = snap(min(r.height, displaySize.height))
+        let x = snap(min(max(r.minX, 0), displaySize.width - width))
+        let y = snap(min(max(r.minY, 0), displaySize.height - height))
+        let clamped = CGRect(
+            x: max(0, x),
+            y: max(0, y),
+            width: min(width, displaySize.width - max(0, x)),
+            height: min(height, displaySize.height - max(0, y))
+        )
+        guard clamped.width >= minimum, clamped.height >= minimum else { return nil }
+        let tolerance = 0.5 / s
+        if clamped.minX <= tolerance, clamped.minY <= tolerance,
+           abs(clamped.width - displaySize.width) <= tolerance, abs(clamped.height - displaySize.height) <= tolerance {
+            return nil
+        }
+        return clamped
+    }
+
+    /// Native pixel size of a display area: crop size × display scale.
+    static func cropPixelSize(_ crop: CGRect, scale: CGFloat) -> CGSize {
+        let s = max(scale, 1)
+        return CGSize(width: max(2, (crop.width * s).rounded()), height: max(2, (crop.height * s).rounded()))
+    }
+
+    /// Aspect-fit rect of `aspect` (width / height) centered in `bounds`, integer pixels.
+    static func aspectFitRect(aspect: CGFloat, in bounds: CGRect) -> CGRect {
+        guard aspect > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
+        var width = bounds.width
+        var height = (width / aspect).rounded(.down)
+        if height > bounds.height {
+            height = bounds.height
+            width = (height * aspect).rounded(.down)
+        }
+        let x = (bounds.minX + (bounds.width - width) / 2).rounded(.down)
+        let y = (bounds.minY + (bounds.height - height) / 2).rounded(.down)
+        return CGRect(x: x, y: y, width: max(1, width), height: max(1, height))
+    }
+
     /// Native pixel size of the filter content (points × backing scale).
     static func nativePixelSize(of filter: SCContentFilter) -> CGSize {
         let rect = filter.contentRect
@@ -380,12 +460,17 @@ public final class SCScreenCapture: ScreenCapturing, @unchecked Sendable {
         lhs.capturesSystemAudio == rhs.capturesSystemAudio && lhs.microphoneID == rhs.microphoneID
     }
 
-    static func makeStreamConfiguration(_ config: CaptureConfig, size: CGSize) -> SCStreamConfiguration {
+    /// `sourceRect`: display area in points of the display's logical coordinate system (top-left origin).
+    /// `nil` leaves it unset (`.zero`), which streams the whole display or window.
+    static func makeStreamConfiguration(_ config: CaptureConfig, size: CGSize, sourceRect: CGRect? = nil) -> SCStreamConfiguration {
         let fps = min(max(config.fps, 1), 120)
         let scConfig = SCStreamConfiguration()
         scConfig.streamName = "ScreenyPro"
         scConfig.width = Int(size.width)
         scConfig.height = Int(size.height)
+        if let sourceRect {
+            scConfig.sourceRect = sourceRect
+        }
         scConfig.pixelFormat = kCVPixelFormatType_32BGRA
         scConfig.colorSpaceName = CGColorSpace.sRGB
         scConfig.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
@@ -449,14 +534,18 @@ private final class ScreenStreamReceiver: NSObject, SCStreamOutput, SCStreamDele
     private var requestedSize: CGSize
     private var pendingSize: CGSize?
     private var resizeScheduled = false
+    /// Aspect ratio (width / height) of the display area when `sourceRect` is used, else `nil`.
+    private var cropAspect: CGFloat?
 
-    init(owner: SCScreenCapture, generation: Int, frames: LatestFrameBox, isWindow: Bool, maxPixelSize: CGSize, outputSize: CGSize) {
+    init(owner: SCScreenCapture, generation: Int, frames: LatestFrameBox, isWindow: Bool, maxPixelSize: CGSize,
+         outputSize: CGSize, cropAspect: CGFloat?) {
         self.owner = owner
         self.generation = generation
         self.frames = frames
         self.isWindow = isWindow
         self.maxPixelSize = maxPixelSize
         self.requestedSize = outputSize
+        self.cropAspect = cropAspect
     }
 
     var hasStopped: Bool { lock.sync { stopped } }
@@ -470,10 +559,11 @@ private final class ScreenStreamReceiver: NSObject, SCStreamOutput, SCStreamDele
     }
 
     /// New source or config on the same stream.
-    func reset(isWindow: Bool, maxPixelSize: CGSize, outputSize: CGSize) {
+    func reset(isWindow: Bool, maxPixelSize: CGSize, outputSize: CGSize, cropAspect: CGFloat?) {
         lock.sync {
             self.isWindow = isWindow
             self.maxPixelSize = maxPixelSize
+            self.cropAspect = cropAspect
             requestedSize = outputSize
             pendingSize = nil
             resizeScheduled = false
@@ -534,6 +624,7 @@ private final class ScreenStreamReceiver: NSObject, SCStreamOutput, SCStreamDele
 
         // contentRect is in points of the output buffer, origin top-left; × scaleFactor = pixels.
         var contentRect = bufferRect
+        var reportedRect: CGRect?
         if let pointRect, scaleFactor > 0 {
             let pixelRect = CGRect(x: pointRect.minX * scaleFactor,
                                    y: pointRect.minY * scaleFactor,
@@ -542,15 +633,27 @@ private final class ScreenStreamReceiver: NSObject, SCStreamOutput, SCStreamDele
                 .integral
                 .intersection(bufferRect)
             if !pixelRect.isNull, pixelRect.width >= 1, pixelRect.height >= 1 {
+                reportedRect = pixelRect
                 contentRect = pixelRect
             }
         }
 
-        let frame = VideoFrame(pixelBuffer: pixelBuffer, contentRect: contentRect, time: sampleBuffer.presentationTimeStamp)
-
         var scheduleResize = false
         let published: Bool = lock.sync {
             guard isActive else { return false }
+            // Display area: the stream size has the area's aspect, so the content fills the buffer
+            // (at most a 1 px letterbox from rounding). Trust the reported rect only when it matches that.
+            if let cropAspect {
+                let expected = SCScreenCapture.aspectFitRect(aspect: cropAspect, in: bufferRect)
+                if let reported = reportedRect,
+                   abs(reported.minX - expected.minX) <= 2, abs(reported.minY - expected.minY) <= 2,
+                   abs(reported.width - expected.width) <= 2, abs(reported.height - expected.height) <= 2 {
+                    contentRect = reported
+                } else {
+                    contentRect = expected
+                }
+            }
+            let frame = VideoFrame(pixelBuffer: pixelBuffer, contentRect: contentRect, time: sampleBuffer.presentationTimeStamp)
             frames.set(frame)
 
             // Window capture: follow the window's native pixel size.

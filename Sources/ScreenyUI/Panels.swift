@@ -240,6 +240,16 @@ final class CountdownController {
         window.orderFrontRegardless()
     }
 
+    /// Centered on the capture area (AppKit global coordinates), kept on its screen.
+    func show(centeredIn area: CGRect, on screen: NSScreen) {
+        let frame = screen.frame
+        var origin = NSPoint(x: area.midX - Self.size.width / 2, y: area.midY - Self.size.height / 2)
+        origin.x = min(max(origin.x, frame.minX), frame.maxX - Self.size.width)
+        origin.y = min(max(origin.y, frame.minY), frame.maxY - Self.size.height)
+        window.setFrame(NSRect(origin: origin, size: Self.size), display: true)
+        window.orderFrontRegardless()
+    }
+
     func hide() {
         window.orderOut(nil)
     }

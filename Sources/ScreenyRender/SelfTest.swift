@@ -9,9 +9,13 @@ import ScreenyCore
 /// (1440p, 30 fps) → `MovieRecorder` for 3 s, with a 440 Hz microphone tone and a 660 Hz system tone.
 /// The camera corner changes once, and there is one 0.5 s pause. The result must have one 2560×1440 video
 /// track, one audio track and a duration of 2.3–2.8 s.
+///
+/// `portrait: true` runs the same check on a 1080×1920 (9:16) canvas. The synthetic screen is a narrow window
+/// with the aspect ratio of the portrait screen slot (so it fills the slot), at 2× the slot size like a
+/// Retina capture. The mid-run style change toggles the camera mirroring (the corner is not used in portrait).
 public enum SelfTest {
-    public static func run(outputURL: URL) async throws {
-        let rig = try SelfTestRig(outputURL: outputURL)
+    public static func run(outputURL: URL, portrait: Bool = false) async throws {
+        let rig = try SelfTestRig(outputURL: outputURL, portrait: portrait)
         defer { rig.stopSources() }
         try await rig.record()
         let url = try await rig.recorder.finish()
@@ -26,6 +30,9 @@ public enum SelfTest {
         guard Int(size.width) == Int(canvas.width), Int(size.height) == Int(canvas.height) else {
             throw SelfTestError("video size is \(Int(size.width))x\(Int(size.height)), expected \(Int(canvas.width))x\(Int(canvas.height))")
         }
+        // A portrait file must be stored upright, not as a rotated landscape track.
+        let transform = try await videoTracks[0].load(.preferredTransform)
+        guard transform.isIdentity else { throw SelfTestError("video track has a non-identity transform \(transform)") }
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         guard audioTracks.count == 1 else { throw SelfTestError("expected 1 audio track, found \(audioTracks.count)") }
         if let format = try await audioTracks[0].load(.formatDescriptions).first,
@@ -43,7 +50,10 @@ public enum SelfTest {
 
 /// Wires synthetic sources, the pipeline and the recorder. Also used by the A/V sync check.
 final class SelfTestRig: @unchecked Sendable {
-    let canvas = CGSize(width: 2560, height: 1440)
+    static let landscapeCanvas = CGSize(width: 2560, height: 1440)
+    static let portraitCanvas = CGSize(width: 1080, height: 1920)
+    let canvas: CGSize
+    let portrait: Bool
     let fps = 30
     let screenBox = LatestFrameBox()
     let cameraBox = LatestFrameBox()
@@ -65,14 +75,27 @@ final class SelfTestRig: @unchecked Sendable {
     private var audioTimer: DispatchSourceTimer?
     private let origin = CMClockGetTime(CMClockGetHostTimeClock())
 
-    init(outputURL: URL) throws {
-        screen = try SyntheticScreen()
+    init(outputURL: URL, portrait: Bool = false) throws {
+        self.portrait = portrait
+        canvas = portrait ? Self.portraitCanvas : Self.landscapeCanvas
+        if portrait {
+            let size = Self.portraitScreenSourceSize(canvas: canvas, style: StyleSettings())
+            screen = try SyntheticScreen(width: size.width, height: size.height, layout: .narrow)
+        } else {
+            screen = try SyntheticScreen()
+        }
         camera = try SyntheticCamera()
         pipeline = FramePipeline(screen: screenBox, camera: cameraBox)
         recorder = MovieRecorder(config: RecordingConfig(
             outputURL: outputURL, canvasSize: canvas, fps: fps, codec: .h264,
             hasSystemAudio: true, hasMicrophone: true
         ))
+    }
+
+    /// A Retina-like (2×) source with exactly the aspect ratio of the portrait screen slot.
+    static func portraitScreenSourceSize(canvas: CGSize, style: StyleSettings) -> (width: Int, height: Int) {
+        let slot = PortraitLayout.slots(canvasSize: canvas, style: style, cameraVisible: true).screen
+        return (max(2, Int(slot.width.rounded()) * 2), max(2, Int(slot.height.rounded()) * 2))
     }
 
     private func seconds(_ time: CMTime) -> Double {
@@ -158,7 +181,11 @@ final class SelfTestRig: @unchecked Sendable {
 
         try await sleep(until: start, plus: styleChangeAt)
         var style = pipeline.style
-        style.camera.corner = .topLeft
+        if portrait {
+            style.camera.mirrored.toggle()
+        } else {
+            style.camera.corner = .topLeft
+        }
         pipeline.style = style
 
         try await sleep(until: start, plus: pauseAt)

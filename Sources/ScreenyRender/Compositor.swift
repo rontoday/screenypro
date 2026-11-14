@@ -40,25 +40,42 @@ final class Compositor {
         var canvas: CGSize
     }
 
+    /// A card shadow that is baked into the static under layer.
+    private struct ShadowShape: Equatable {
+        var rect: CGRect
+        var radius: CGFloat
+        var shadow: CanvasLayout.Shadow
+    }
+
     private struct UnderKey: Equatable {
         var background: BackgroundKey
         var screen: CanvasLayout.Screen?
+        /// Portrait only: the camera card shadow lies under both cards.
+        var cameraShadow: ShadowShape?
     }
 
     private struct ScreenKey: Equatable {
         var screen: CanvasLayout.Screen
-        var canvasHeight: CGFloat
+        var canvas: CGSize
     }
 
     private struct CameraKey: Equatable {
         var camera: CanvasLayout.Camera
-        var canvasHeight: CGFloat
+        var canvas: CGSize
+    }
+
+    private struct CameraParts {
+        /// `nil` when the card is a plain rectangle (the content is already cropped to it).
+        var mask: CIImage?
+        var border: CIImage?
+        /// Shadow drawn over the screen content (landscape bubble). `nil` when it is in the under layer.
+        var shadow: CIImage?
     }
 
     private var backgroundCache: (key: BackgroundKey, image: CIImage)?
     private var underCache: (key: UnderKey, image: CIImage)?
     private var screenCache: (key: ScreenKey, mask: CIImage?, hairline: CIImage?)?
-    private var cameraCache: (key: CameraKey, mask: CIImage, border: CIImage, shadow: CIImage?)?
+    private var cameraCache: (key: CameraKey, parts: CameraParts)?
     private var loggedImageFailure: URL?
 
     init() throws {
@@ -187,7 +204,7 @@ final class Compositor {
             let rect = CanvasLayout.flipped(cameraLayout.rect, height: canvas.height)
             let parts = cameraParts(cameraLayout)
             let full = Self.contentRect(of: freshCamera)
-            let crop = CanvasLayout.aspectFillCrop(source: full, target: rect.size)
+            let crop = CanvasLayout.aspectFillCrop(source: full, target: rect.size, maxTopCrop: cameraLayout.maxTopCrop)
             var content = Self.scaledContent(
                 CIImage(cvPixelBuffer: freshCamera.pixelBuffer, options: Self.imageOptions(for: freshCamera.pixelBuffer)),
                 bufferHeight: CGFloat(CVPixelBufferGetHeight(freshCamera.pixelBuffer)),
@@ -195,12 +212,16 @@ final class Compositor {
                 mirrored: cameraLayout.mirrored,
                 into: rect
             )
-            content = content.applyingFilter("CISourceInCompositing", parameters: [kCIInputBackgroundImageKey: parts.mask])
+            if let mask = parts.mask {
+                content = content.applyingFilter("CISourceInCompositing", parameters: [kCIInputBackgroundImageKey: mask])
+            }
             if let shadow = parts.shadow {
                 image = shadow.composited(over: image)
             }
             image = content.composited(over: image)
-            image = parts.border.composited(over: image)
+            if let border = parts.border {
+                image = border.composited(over: image)
+            }
         }
 
         return image.cropped(to: canvasRect)
@@ -258,10 +279,14 @@ final class Compositor {
 
     // MARK: Static layers
 
-    /// Background + screen shadow, opaque, canvas size. Rebuilt only when the background, canvas or card changes.
+    /// Background + card shadows, opaque, canvas size. Rebuilt only when the background, canvas or a card changes.
     private func underLayer(layout: CanvasLayout, background: BackgroundStyle) -> CIImage {
         let bgKey = BackgroundKey(background: background, canvas: canvas)
-        let key = UnderKey(background: bgKey, screen: layout.screen)
+        var cameraShadow: ShadowShape?
+        if let camera = layout.camera, camera.shadowInBackground, camera.shadow.isVisible {
+            cameraShadow = ShadowShape(rect: camera.rect, radius: camera.cornerRadius, shadow: camera.shadow)
+        }
+        let key = UnderKey(background: bgKey, screen: layout.screen, cameraShadow: cameraShadow)
         if let cached = underCache, cached.key == key { return cached.image }
 
         let canvasRect = CGRect(origin: .zero, size: canvas)
@@ -279,6 +304,11 @@ final class Compositor {
                 image = shadowImage(rect: rect, radius: screen.cornerRadius, shadow: screen.shadow).composited(over: image)
             }
         }
+        if let cameraShadow {
+            // Black shadows over each other: the order does not matter.
+            let rect = CanvasLayout.flipped(cameraShadow.rect, height: canvas.height)
+            image = shadowImage(rect: rect, radius: cameraShadow.radius, shadow: cameraShadow.shadow).composited(over: image)
+        }
         if addNoise {
             image = Self.addingNoise(to: image)
         }
@@ -288,7 +318,7 @@ final class Compositor {
     }
 
     private func screenParts(_ screen: CanvasLayout.Screen) -> (mask: CIImage?, hairline: CIImage?) {
-        let key = ScreenKey(screen: screen, canvasHeight: canvas.height)
+        let key = ScreenKey(screen: screen, canvas: canvas)
         if let cached = screenCache, cached.key == key { return (cached.mask, cached.hairline) }
         let rect = CanvasLayout.flipped(screen.rect, height: canvas.height)
         var mask: CIImage?
@@ -305,22 +335,26 @@ final class Compositor {
         return (mask, hairline)
     }
 
-    private func cameraParts(_ camera: CanvasLayout.Camera) -> (mask: CIImage, border: CIImage, shadow: CIImage?) {
-        let key = CameraKey(camera: camera, canvasHeight: canvas.height)
-        if let cached = cameraCache, cached.key == key { return (cached.mask, cached.border, cached.shadow) }
+    private func cameraParts(_ camera: CanvasLayout.Camera) -> CameraParts {
+        let key = CameraKey(camera: camera, canvas: canvas)
+        if let cached = cameraCache, cached.key == key { return cached.parts }
         let rect = CanvasLayout.flipped(camera.rect, height: canvas.height)
         let ellipse = camera.shape == .circle
-        let mask = shapeImage(size: rect.size, radius: camera.cornerRadius, ellipse: ellipse, stroke: nil, alpha: 1)
-            .map { placed($0, at: rect.origin) } ?? CIImage(color: .white).cropped(to: rect)
-        let border = shapeImage(size: rect.size, radius: camera.cornerRadius, ellipse: ellipse, stroke: camera.borderWidth, alpha: 0.2)
-            .map { placed($0, at: rect.origin) } ?? CIImage.empty()
-        var shadow: CIImage?
-        if camera.shadow.isVisible {
-            let raw = shadowImage(rect: rect, radius: camera.cornerRadius, shadow: camera.shadow)
-            shadow = bake(raw, opaque: false) ?? raw
+        var parts = CameraParts()
+        if ellipse || camera.cornerRadius > 0 {
+            parts.mask = shapeImage(size: rect.size, radius: camera.cornerRadius, ellipse: ellipse, stroke: nil, alpha: 1)
+                .map { placed($0, at: rect.origin) } ?? CIImage(color: .white).cropped(to: rect)
         }
-        cameraCache = (key, mask, border, shadow)
-        return (mask, border, shadow)
+        if camera.borderWidth > 0 {
+            parts.border = shapeImage(size: rect.size, radius: camera.cornerRadius, ellipse: ellipse, stroke: camera.borderWidth, alpha: 0.2)
+                .map { placed($0, at: rect.origin) } ?? CIImage.empty()
+        }
+        if camera.shadow.isVisible, !camera.shadowInBackground {
+            let raw = shadowImage(rect: rect, radius: camera.cornerRadius, shadow: camera.shadow)
+            parts.shadow = bake(raw, opaque: false) ?? raw
+        }
+        cameraCache = (key, parts)
+        return parts
     }
 
     private func placed(_ image: CGImage, at origin: CGPoint) -> CIImage {

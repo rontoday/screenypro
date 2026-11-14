@@ -58,19 +58,34 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     var isVisible: Bool { window?.isVisible ?? false }
 
+    /// On screen and not in the Dock.
+    var isShown: Bool { (window?.isVisible ?? false) && !(window?.isMiniaturized ?? false) }
+
+    /// Called when the window is shown, hidden, minimized or restored.
+    var onVisibilityChange: (() -> Void)?
+
     func show() {
         guard let window else { return }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        onVisibilityChange?()
     }
 
     func hide() {
         window?.orderOut(nil)
+        onVisibilityChange?()
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
         controller.mainWindowDidBecomeKey()
+        onVisibilityChange?()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) { onVisibilityChange?() }
+    func windowDidDeminiaturize(_ notification: Notification) { onVisibilityChange?() }
+    func windowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.onVisibilityChange?() }
     }
 }
 
@@ -86,6 +101,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var hud: HUDController!
     private var countdown: CountdownController!
     private var statusItem: StatusItemController!
+    private let areaPicker = AreaPickerController()
+    private let areaOutline = AreaOutlineController()
+    private var outlineUpdateQueued = false
+    /// The picker hid a visible main window; it comes back when the picker or a countdown started from it ends.
+    private var mainHiddenForPicker = false
     private var cancellables: Set<AnyCancellable> = []
     private var previousState: RecorderController.State = .idle
     private var mainWasVisibleBeforeCountdown = true
@@ -106,6 +126,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         statusItem = StatusItemController(controller: controller) { [weak self] in self?.mainWindow.show() }
 
         controller.onAlert = { [weak self] info in self?.presentAlert(info) }
+        controller.onSelectArea = { [weak self] in self?.beginAreaSelection() }
+        mainWindow.onVisibilityChange = { [weak self] in self?.updateOutline() }
+        // Any published change (settings, displays, camera state) may move the area: coalesce to one update.
+        controller.objectWillChange
+            .sink { [weak self] _ in self?.queueOutlineUpdate() }
+            .store(in: &cancellables)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.areaPicker.isActive { self.areaPicker.cancel() }
+                self.controller.screensDidChange()
+                self.updateOutline()
+            }
+        }
         controller.clock.onTick = { [weak self] elapsed in
             guard let self else { return }
             self.statusItem.update(state: self.controller.state, elapsed: elapsed)
@@ -146,9 +182,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         previousState = state
 
         if state.isCountdown && !previous.isCountdown {
-            mainWasVisibleBeforeCountdown = mainWindow.isVisible
+            let hiddenForPicker = areaPicker.isActive && mainHiddenForPicker
+            if areaPicker.isActive { areaPicker.cancel() }
+            mainWasVisibleBeforeCountdown = mainWindow.isVisible || hiddenForPicker
             mainWindow.hide()
-            countdown.show(onDisplay: controller.recordedDisplayID)
+            if let area = controller.activeAreaOnScreen() {
+                countdown.show(centeredIn: area.rect, on: area.screen)
+            } else {
+                countdown.show(onDisplay: controller.recordedDisplayID)
+            }
             HotKeyCenter.shared.register(.cancelCountdown, keyCode: kVK_Escape, modifiers: 0) { [weak self] in
                 self?.controller.cancelCountdown()
             }
@@ -174,6 +216,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             break
         }
         statusItem.update(state: state, elapsed: controller.clock.elapsed)
+        queueOutlineUpdate()
+    }
+
+    // MARK: Area picker and outline
+
+    private func beginAreaSelection() {
+        guard controller.canSelectArea, let display = controller.selectedDisplay else { return }
+        guard let screen = NSScreen.screens.first(where: { $0.displayID == display.id }) else {
+            controller.banner = .init(kind: .error, message: "This display is not available for area selection.")
+            return
+        }
+        let mainWasVisible = mainWindow.isShown
+        // Hide the main window, so the whole display can be seen and selected.
+        mainHiddenForPicker = mainWasVisible
+        mainWindow.hide()
+        var lockLabel: String?
+        if let aspect = controller.areaAspectLock, let slot = controller.portraitSlots?.screen {
+            lockLabel = String(format: "Locked to the 9:16 screen slot · %d × %d px · %.2f : 1",
+                               Int(slot.width), Int(slot.height), Double(aspect))
+        }
+        areaPicker.begin(on: screen, initial: controller.pickerInitialArea, aspect: controller.areaAspectLock,
+                         lockLabel: lockLabel) { [weak self] rect in
+            guard let self else { return }
+            self.mainHiddenForPicker = false
+            if let rect { self.controller.applyPickedArea(rect, displayID: display.id) }
+            if mainWasVisible && self.controller.state.allowsOutputChanges { self.mainWindow.show() }
+            self.updateOutline()
+        }
+        updateOutline()
+    }
+
+    private func queueOutlineUpdate() {
+        guard !outlineUpdateQueued else { return }
+        outlineUpdateQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.outlineUpdateQueued = false
+            self.updateOutline()
+        }
+    }
+
+    /// The outline shows around the active area while idle with the main window on screen, and while recording.
+    private func updateOutline() {
+        let visibleForState: Bool
+        switch controller.state {
+        case .idle, .finished: visibleForState = mainWindow.isShown
+        case .countdown, .recording, .paused: visibleForState = true
+        case .finishing: visibleForState = false
+        }
+        guard visibleForState, !areaPicker.isActive, let area = controller.activeAreaOnScreen() else {
+            areaOutline.hide()
+            return
+        }
+        areaOutline.show(area: area.rect, on: area.screen)
+    }
+
+    @objc func selectArea(_ sender: Any?) {
+        controller.selectArea()
     }
 
     private func presentAlert(_ info: RecorderController.AlertInfo) {
@@ -233,6 +333,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case #selector(togglePause(_:)):
             menuItem.title = controller.state == .paused ? "Resume" : "Pause"
             return controller.state.isCapturingSession
+        case #selector(selectArea(_:)):
+            return controller.canSelectArea && !areaPicker.isActive
         default:
             return true
         }
@@ -262,6 +364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let pause = recordMenu.addItem(withTitle: "Pause", action: #selector(togglePause(_:)), keyEquivalent: "p")
         pause.keyEquivalentModifierMask = [.command, .shift]
         pause.target = self
+        recordMenu.addItem(.separator())
+        let area = recordMenu.addItem(withTitle: "Select Recording Area…", action: #selector(selectArea(_:)), keyEquivalent: "")
+        area.target = self
         recordMenu.addItem(.separator())
         let folder = recordMenu.addItem(withTitle: "Open Recordings Folder", action: #selector(openRecordingsFolder(_:)), keyEquivalent: "")
         folder.target = self

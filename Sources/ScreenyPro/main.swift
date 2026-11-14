@@ -6,9 +6,11 @@ import ScreenyRender
 import ScreenyUI
 
 // Headless check of the compositor and the recorder. It needs no privacy permissions.
-// Usage: ScreenyPro --selftest /path/to/out.mp4
+// Usage: ScreenyPro --selftest /path/to/out.mp4      (16:9)
+//        ScreenyPro --selftest-portrait /path/to/out.mp4   (9:16)
 let arguments = CommandLine.arguments
-if let index = arguments.firstIndex(of: "--selftest") {
+let selfTestPortrait = arguments.contains("--selftest-portrait")
+if let index = arguments.firstIndex(of: "--selftest") ?? arguments.firstIndex(of: "--selftest-portrait") {
     guard arguments.count > index + 1 else {
         FileHandle.standardError.write(Data("usage: ScreenyPro --selftest <out.mp4>\n".utf8))
         exit(2)
@@ -18,7 +20,7 @@ if let index = arguments.firstIndex(of: "--selftest") {
     var failure: Error?
     Task.detached {
         do {
-            try await SelfTest.run(outputURL: url)
+            try await SelfTest.run(outputURL: url, portrait: selfTestPortrait)
         } catch {
             failure = error
         }

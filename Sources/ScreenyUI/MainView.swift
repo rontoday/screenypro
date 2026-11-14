@@ -67,9 +67,14 @@ private struct StagePane: View {
 private struct PreviewCard: View {
     @ObservedObject var controller: RecorderController
 
+    private var aspect: CGFloat {
+        let canvas = controller.settings.output.canvasSize
+        return canvas.height > 0 ? canvas.width / canvas.height : 16.0 / 9.0
+    }
+
     var body: some View {
         PreviewHost(preview: controller.previewView)
-            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .aspectRatio(aspect, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -77,10 +82,22 @@ private struct PreviewCard: View {
             )
             .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
             .overlay(alignment: .bottomLeading) {
-                SourceChip(title: controller.sourceTitle, isWindow: controller.settings.sourceKind == .window)
-                    .padding(10)
+                SourceChip(
+                    title: controller.sourceTitle,
+                    isWindow: controller.settings.sourceKind == .window,
+                    areaText: areaText
+                )
+                .padding(10)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(Theme.stateAnimation, value: controller.settings.output.format)
+    }
+}
+
+extension PreviewCard {
+    /// "Area" when only a part of the display is recorded.
+    fileprivate var areaText: String? {
+        controller.effectiveArea == nil ? nil : "Area"
     }
 }
 
@@ -88,15 +105,22 @@ private struct PreviewCard: View {
 private struct SourceChip: View {
     let title: String
     let isWindow: Bool
+    var areaText: String?
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: isWindow ? "macwindow" : "display")
+            Image(systemName: isWindow ? "macwindow" : (areaText == nil ? "display" : "rectangle.dashed"))
                 .font(.system(size: 10, weight: .semibold))
             Text(title)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if let areaText {
+                Text(areaText)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .fixedSize()
+            }
         }
         .foregroundStyle(Color.white.opacity(0.85))
         .padding(.horizontal, 8)
@@ -153,8 +177,7 @@ private struct RecordBar: View {
     }
 
     private var outputSummary: String {
-        let o = controller.settings.output
-        return "\(o.resolution.label) · \(o.fps) fps · \(Format.codec(o.codec))"
+        Format.outputSummary(controller.settings.output)
     }
 
     private var microphoneName: String? {

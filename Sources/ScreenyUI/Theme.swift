@@ -89,6 +89,18 @@ enum Format {
         }
     }
 
+    /// "1440p · 30 fps · H.264" (landscape) or "1080×1920 · 30 fps · H.264" (portrait).
+    static func outputSummary(_ output: OutputSettings) -> String {
+        let size: String
+        if output.format == .portrait {
+            let canvas = output.canvasSize
+            size = "\(Int(canvas.width))×\(Int(canvas.height))"
+        } else {
+            size = output.resolution.label
+        }
+        return "\(size) · \(output.fps) fps · \(codec(output.codec))"
+    }
+
     static func fileSize(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }

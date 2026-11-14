@@ -9,6 +9,8 @@ struct InspectorView: View {
     var body: some View {
         ScrollView(.vertical) {
             VStack(spacing: 0) {
+                FormatSection(controller: controller)
+                Hairline()
                 SourceSection(controller: controller)
                 Hairline()
                 CameraSection(controller: controller)
@@ -24,6 +26,78 @@ struct InspectorView: View {
         .scrollIndicators(.automatic)
         .disabled(controller.screenPermission != .granted)
         .opacity(controller.screenPermission == .granted ? 1 : 0.5)
+    }
+}
+
+// MARK: - Format
+
+private struct FormatSection: View {
+    @ObservedObject var controller: RecorderController
+
+    var body: some View {
+        InspectorSection("Format") {
+            HStack(spacing: 10) {
+                FormatTile(format: .landscape, title: "16:9", caption: "Landscape", selection: $controller.settings.output.format)
+                FormatTile(format: .portrait, title: "9:16", caption: "Reels", selection: $controller.settings.output.format)
+            }
+            .padding(.horizontal, 2)
+        }
+        .disabled(!controller.state.allowsOutputChanges)
+    }
+}
+
+private struct FormatTile: View {
+    let format: CanvasFormat
+    let title: String
+    let caption: String
+    @Binding var selection: CanvasFormat
+    @State private var hovered = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    private var selected: Bool { selection == format }
+
+    var body: some View {
+        Button {
+            withAnimation(Theme.stateAnimation) { selection = format }
+        } label: {
+            HStack(spacing: 9) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                        .fill(selected ? Theme.accent.opacity(0.28) : Color.white.opacity(0.06))
+                    RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                        .strokeBorder(selected ? Theme.accent : Color.white.opacity(0.45), lineWidth: 1.5)
+                }
+                .frame(width: format == .landscape ? 22 : 13, height: format == .landscape ? 13 : 22)
+                .frame(width: 22, height: 22)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(Theme.primaryText)
+                    Text(caption)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondaryText)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 9)
+            .frame(height: 44)
+            .background(
+                RoundedRectangle(cornerRadius: Theme.controlRadius, style: .continuous)
+                    .fill(selected ? Color.white.opacity(0.09) : (hovered && isEnabled ? Theme.fieldFillHover : Theme.fieldFill))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.controlRadius, style: .continuous)
+                    .strokeBorder(Theme.fieldBorder, lineWidth: 1)
+            )
+            .selectionRing(selected, cornerRadius: Theme.controlRadius)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .opacity(isEnabled ? 1 : 0.45)
+        .help(format == .landscape ? "16:9 canvas for screencasts" : "9:16 canvas for Reels, Shorts and TikTok: screen on top, camera below")
     }
 }
 
@@ -55,6 +129,10 @@ private struct SourceSection: View {
                 )
             )
             sourceList
+            if controller.settings.sourceKind == .display && controller.selectedDisplay != nil {
+                AreaControls(controller: controller)
+                    .padding(.top, 2)
+            }
         }
         .disabled(!controller.state.allowsOutputChanges)
     }
@@ -124,6 +202,58 @@ private struct SourceSection: View {
             selected: selected,
             action: row.action
         )
+    }
+}
+
+/// "Area: Full display / Custom area" and "Select area…" for a display source.
+private struct AreaControls: View {
+    @ObservedObject var controller: RecorderController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            LabeledRow(title: "Area") {
+                SegmentedPicker(
+                    options: [
+                        .init(value: false, title: controller.isPortrait ? "Centered" : "Full display"),
+                        .init(value: true, title: "Custom area"),
+                    ],
+                    selection: Binding(
+                        get: { controller.usesCustomArea },
+                        set: { controller.setUsesCustomArea($0) }
+                    )
+                )
+                .frame(width: 184)
+            }
+            Button(action: controller.selectArea) {
+                Label("Select Area…", systemImage: "rectangle.dashed")
+            }
+            .buttonStyle(ToolButtonStyle(kind: .secondary, fullWidth: true))
+            .disabled(!controller.canSelectArea)
+            if let detail {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: controller.usesAutomaticArea ? "info.circle" : "rectangle.dashed")
+                        .font(.system(size: 11))
+                        .foregroundStyle(controller.usesAutomaticArea ? Theme.accent : Theme.secondaryText)
+                        .padding(.top, 1)
+                    Text(detail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var detail: String? {
+        guard let area = controller.effectiveArea else { return nil }
+        let size = "\(Int(area.width.rounded())) × \(Int(area.height.rounded())) pt"
+        if controller.usesAutomaticArea {
+            return "9:16 records a centered \(size) area that fills the screen slot. Select an area to choose another part."
+        }
+        if controller.isPortrait {
+            return "\(size), locked to the screen slot."
+        }
+        return "\(size) at \(Int(area.minX.rounded())), \(Int(area.minY.rounded()))"
     }
 }
 
@@ -213,20 +343,27 @@ private struct CameraSection: View {
                     emptyTitle: "No camera found",
                     onSelect: { controller.settings.cameraDeviceID = $0 }
                 )
-                LabeledRow(title: "Shape") {
-                    SegmentedPicker(
-                        options: [
-                            .init(value: CameraShape.roundedRect, title: "Rounded"),
-                            .init(value: CameraShape.circle, title: "Circle"),
-                        ],
-                        selection: camera.shape
-                    )
-                    .frame(width: 160)
+                if controller.isPortrait {
+                    // Portrait: the camera fills the bottom slot; only its height is a choice.
+                    ValueSlider(title: "Camera height", value: camera.portraitShare, range: 0.25...0.6) {
+                        "\(Int(($0 * 100).rounded()))%"
+                    }
+                } else {
+                    LabeledRow(title: "Shape") {
+                        SegmentedPicker(
+                            options: [
+                                .init(value: CameraShape.roundedRect, title: "Rounded"),
+                                .init(value: CameraShape.circle, title: "Circle"),
+                            ],
+                            selection: camera.shape
+                        )
+                        .frame(width: 160)
+                    }
+                    LabeledRow(title: "Position") {
+                        CornerPicker(selection: camera.corner, shape: camera.wrappedValue.shape)
+                    }
+                    ValueSlider(title: "Size", value: camera.size, range: 0.15...0.45) { "\(Int(($0 * 100).rounded()))%" }
                 }
-                LabeledRow(title: "Position") {
-                    CornerPicker(selection: camera.corner, shape: camera.wrappedValue.shape)
-                }
-                ValueSlider(title: "Size", value: camera.size, range: 0.15...0.45) { "\(Int(($0 * 100).rounded()))%" }
                 ToggleRow(title: "Mirror", isOn: camera.mirrored)
             }
             .disabled(!camera.wrappedValue.enabled)
