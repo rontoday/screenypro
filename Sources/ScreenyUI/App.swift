@@ -109,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var cancellables: Set<AnyCancellable> = []
     private var previousState: RecorderController.State = .idle
     private var mainWasVisibleBeforeCountdown = true
+    /// The user confirmed "Quit anyway" during an upload.
+    private var quitConfirmed = false
+    private var isConfirmingQuit = false
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
@@ -124,6 +127,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         hud = HUDController(controller: controller)
         countdown = CountdownController(controller: controller)
         statusItem = StatusItemController(controller: controller) { [weak self] in self?.mainWindow.show() }
+        statusItem.onCloudSettings = { [weak self] in self?.showCloudSettings(nil) }
+        controller.sharing.isMainWindowShown = { [weak self] in self?.mainWindow.isShown ?? false }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.controller.sharing.refreshConfiguration() }
+        }
 
         controller.onAlert = { [weak self] info in self?.presentAlert(info) }
         controller.onSelectArea = { [weak self] in self?.beginAreaSelection() }
@@ -166,7 +176,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        controller.terminationReply()
+        if controller.sharing.isBusy && !quitConfirmed {
+            if !isConfirmingQuit { confirmQuitDuringUpload() }
+            return .terminateLater
+        }
+        return controller.terminationReply()
+    }
+
+    /// "An upload is in progress. Quit anyway?" — a sheet on the main window when it is on screen.
+    private func confirmQuitDuringUpload() {
+        isConfirmingQuit = true
+        let alert = NSAlert()
+        alert.messageText = "An upload is in progress. Quit anyway?"
+        let waiting = controller.sharing.queue.count
+        alert.informativeText = "The upload will be cancelled" + (waiting > 0 ? " and \(waiting) waiting upload\(waiting == 1 ? "" : "s") will not start" : "") + ". Nothing stays on the server."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Continue Upload")
+        let quit = alert.addButton(withTitle: "Quit Anyway")
+        quit.hasDestructiveAction = true
+        let handle: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return }
+            self.isConfirmingQuit = false
+            guard response == .alertSecondButtonReturn else {
+                NSApp.reply(toApplicationShouldTerminate: false)
+                return
+            }
+            self.quitConfirmed = true
+            Task { @MainActor in
+                await self.controller.sharing.cancelAllForQuit()
+                switch self.controller.terminationReply() {
+                case .terminateNow: NSApp.reply(toApplicationShouldTerminate: true)
+                case .terminateCancel:
+                    self.quitConfirmed = false
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                case .terminateLater: break // the recorder replies when the file is saved
+                @unknown default: NSApp.reply(toApplicationShouldTerminate: true)
+                }
+            }
+        }
+        if let window = mainWindow.window, mainWindow.isShown, window.attachedSheet == nil {
+            alert.beginSheetModal(for: window, completionHandler: handle)
+        } else {
+            NSApp.activate()
+            handle(alert.runModal())
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -320,6 +373,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         RecorderController.openRecordingsFolder()
     }
 
+    @objc func showCloudSettings(_ sender: Any?) {
+        guard controller.state.allowsOutputChanges else { return }
+        mainWindow.show()
+        controller.sharing.isRecordingsShown = false
+        controller.sharing.showSettings()
+    }
+
+    @objc func showRecentRecordings(_ sender: Any?) {
+        guard controller.state.allowsOutputChanges else { return }
+        mainWindow.show()
+        // A popover needs its window on screen: open it on the next turn of the run loop.
+        DispatchQueue.main.async { [weak self] in self?.controller.sharing.isRecordingsShown = true }
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(toggleRecording(_:)):
@@ -335,6 +402,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return controller.state.isCapturingSession
         case #selector(selectArea(_:)):
             return controller.canSelectArea && !areaPicker.isActive
+        case #selector(showCloudSettings(_:)), #selector(showRecentRecordings(_:)):
+            return controller.state.allowsOutputChanges
         default:
             return true
         }
@@ -346,6 +415,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: "ScreenyPro")
         appMenu.addItem(withTitle: "About ScreenyPro", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let cloud = appMenu.addItem(withTitle: "Cloud Settings…", action: #selector(showCloudSettings(_:)), keyEquivalent: "")
+        cloud.target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide ScreenyPro", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -368,6 +440,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let area = recordMenu.addItem(withTitle: "Select Recording Area…", action: #selector(selectArea(_:)), keyEquivalent: "")
         area.target = self
         recordMenu.addItem(.separator())
+        let recent = recordMenu.addItem(withTitle: "Recent Recordings…", action: #selector(showRecentRecordings(_:)), keyEquivalent: "l")
+        recent.keyEquivalentModifierMask = [.command]
+        recent.target = self
         let folder = recordMenu.addItem(withTitle: "Open Recordings Folder", action: #selector(openRecordingsFolder(_:)), keyEquivalent: "")
         folder.target = self
         recordItem.submenu = recordMenu
@@ -375,7 +450,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
+        // Undo/Cut/Paste: the cloud settings and the title fields need them (pasting the secret, for one).
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
         main.addItem(editItem)

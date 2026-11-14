@@ -6,13 +6,14 @@ import SwiftUI
 /// Facts about a finished recording, loaded off the main thread.
 struct RecordingInfo: Equatable {
     var thumbnail: CGImage?
-    /// Blurred thumbnail that fills the sides of the box behind a tall (9:16) video.
+    /// Blurred thumbnail that fills the box around a video whose aspect differs from the box.
     var backdrop: CGImage?
     var duration: TimeInterval?
     var fileSize: Int64?
     var pixelSize: CGSize?
 
-    static func load(url: URL) async -> RecordingInfo {
+    /// `thumbnailSide` bounds the thumbnail; `backdrop` adds the blurred copy that fills the box around it.
+    static func load(url: URL, thumbnailSide: CGFloat = 960, backdrop: Bool = true) async -> RecordingInfo {
         var info = RecordingInfo()
         if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
            let size = attributes[.size] as? NSNumber {
@@ -29,13 +30,12 @@ struct RecordingInfo: Equatable {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         // Square bound: enough for a 16:9 and a 9:16 thumbnail.
-        generator.maximumSize = CGSize(width: 960, height: 960)
+        generator.maximumSize = CGSize(width: thumbnailSide, height: thumbnailSide)
         let time = CMTime(seconds: min(0.5, (info.duration ?? 0) / 2), preferredTimescale: 600)
         if let result = try? await generator.image(at: time) {
             info.thumbnail = result.image
-            if result.image.height > result.image.width {
-                info.backdrop = blurred(result.image)
-            }
+            // The box can be shorter than the video's aspect on small windows: any video may need the backdrop.
+            if backdrop { info.backdrop = blurred(result.image) }
         }
         return info
     }
@@ -51,43 +51,38 @@ struct RecordingInfo: Equatable {
     }
 }
 
-/// 16:9 box for a landscape video; a full-width box of fixed height for a tall (9:16) video.
-private struct ThumbnailFrame: ViewModifier {
-    let isTall: Bool
-
-    func body(content: Content) -> some View {
-        if isTall {
-            content
-                .frame(maxWidth: .infinity)
-                .frame(height: 252)
-        } else {
-            content.aspectRatio(16.0 / 9.0, contentMode: .fit)
-        }
-    }
-}
-
 /// The "finished sheet": a card over the main window after a recording is saved.
 struct FinishedOverlay: View {
     @ObservedObject var controller: RecorderController
     let url: URL
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.55)
-                .ignoresSafeArea()
-                .onTapGesture {}
-            FinishedCard(controller: controller, url: url)
-                .transition(.scale(scale: 0.97).combined(with: .opacity))
+        GeometryReader { geo in
+            ZStack {
+                Color.black.opacity(0.55)
+                    .ignoresSafeArea()
+                    .onTapGesture {}
+                FinishedCard(controller: controller, sharing: controller.sharing, url: url)
+                    // The thumbnail shrinks first, so the card always fits the window (also at minimum size).
+                    .frame(maxHeight: max(320, geo.size.height - 24))
+                    .transition(.scale(scale: 0.97).combined(with: .opacity))
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
     }
 }
 
 private struct FinishedCard: View {
     @ObservedObject var controller: RecorderController
+    @ObservedObject var sharing: CloudShareCenter
     let url: URL
     @State private var info = RecordingInfo()
     @State private var copied = false
     @State private var confirmingDelete = false
+    @FocusState private var titleFocused: Bool
+
+    /// Natural box height: 16:9 at the card's content width, or the fixed box for a tall video.
+    private var naturalThumbnailHeight: CGFloat { isTall ? 252 : 460 * 9 / 16 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -111,8 +106,8 @@ private struct FinishedCard: View {
                 ZStack {
                     Rectangle().fill(Color.black)
                     if let thumbnail = info.thumbnail {
-                        if isTall, let backdrop = info.backdrop {
-                            // A tall video sits in a wide box: fill the sides with a dim, blurred copy.
+                        if let backdrop = info.backdrop {
+                            // The box rarely has the video's aspect: fill around it with a dim, blurred copy.
                             // Color.clear takes the box size, so the filled copy never grows the layout.
                             Color.clear
                                 .overlay(
@@ -143,7 +138,8 @@ private struct FinishedCard: View {
                                 .offset(x: 2)
                         )
                 }
-                .modifier(ThumbnailFrame(isTall: isTall))
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 96, maxHeight: naturalThumbnailHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -153,6 +149,7 @@ private struct FinishedCard: View {
             }
             .buttonStyle(.plain)
             .help("Play")
+            .layoutPriority(-1)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(url.lastPathComponent)
@@ -170,7 +167,7 @@ private struct FinishedCard: View {
                 Button(action: play) {
                     Label("Play", systemImage: "play.fill")
                 }
-                .buttonStyle(ToolButtonStyle(kind: .primary, fullWidth: true))
+                .buttonStyle(ToolButtonStyle(kind: .secondary, fullWidth: true))
 
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -184,6 +181,10 @@ private struct FinishedCard: View {
                 }
                 .buttonStyle(ToolButtonStyle(kind: .secondary, fullWidth: true))
             }
+
+            Hairline()
+
+            CardShareSection(sharing: sharing, url: url, titleFocused: $titleFocused)
 
             Hairline()
 
@@ -207,7 +208,8 @@ private struct FinishedCard: View {
                 Spacer()
                 Button("Done", action: controller.dismissFinished)
                     .buttonStyle(ToolButtonStyle(kind: .secondary))
-                    .keyboardShortcut(.defaultAction)
+                    // Return in the title field must not close the card.
+                    .keyboardShortcut(titleFocused ? nil : .defaultAction)
             }
             .animation(Theme.stateAnimation, value: confirmingDelete)
         }
@@ -224,6 +226,10 @@ private struct FinishedCard: View {
         .shadow(color: .black.opacity(0.5), radius: 30, y: 12)
         .task(id: url) {
             info = await RecordingInfo.load(url: url)
+        }
+        .onAppear { sharing.visibleCardPath = CloudShareCenter.key(url) }
+        .onDisappear {
+            if sharing.visibleCardPath == CloudShareCenter.key(url) { sharing.visibleCardPath = nil }
         }
     }
 

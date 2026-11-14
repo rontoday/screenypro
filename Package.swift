@@ -9,9 +9,10 @@ let package = Package(
         .target(name: "ScreenyCapture", dependencies: ["ScreenyCore"]),
         .target(name: "ScreenyRender", dependencies: ["ScreenyCore"]),
         .target(name: "ScreenyUI", dependencies: ["ScreenyCore"]),
+        .target(name: "ScreenyCloud", dependencies: ["ScreenyCore"]),
         .executableTarget(
             name: "ScreenyPro",
-            dependencies: ["ScreenyCore", "ScreenyCapture", "ScreenyRender", "ScreenyUI"]
+            dependencies: ["ScreenyCore", "ScreenyCapture", "ScreenyRender", "ScreenyUI", "ScreenyCloud"]
         ),
     ],
     swiftLanguageModes: [.v5]

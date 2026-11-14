@@ -5,6 +5,12 @@ import SwiftUI
 /// Root of the main window: live preview on the left, inspector on the right.
 struct MainView: View {
     @ObservedObject var controller: RecorderController
+    @ObservedObject var sharing: CloudShareCenter
+
+    init(controller: RecorderController) {
+        self.controller = controller
+        self.sharing = controller.sharing
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -25,6 +31,9 @@ struct MainView: View {
             }
         }
         .animation(Theme.stateAnimation, value: controller.state)
+        .sheet(isPresented: $sharing.isSettingsShown, onDismiss: sharing.settingsDismissed) {
+            CloudSettingsView(sharing: sharing)
+        }
         .environment(\.colorScheme, .dark)
     }
 }
@@ -33,6 +42,12 @@ struct MainView: View {
 
 private struct StagePane: View {
     @ObservedObject var controller: RecorderController
+    @ObservedObject var sharing: CloudShareCenter
+
+    init(controller: RecorderController) {
+        self.controller = controller
+        self.sharing = controller.sharing
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,16 +61,23 @@ private struct StagePane: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                if let banner = controller.banner {
-                    BannerView(banner: banner) { controller.banner = nil }
-                        .padding(.top, 12)
-                        .padding(.horizontal, 12)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                VStack(spacing: 8) {
+                    if let banner = controller.banner {
+                        BannerView(banner: banner) { controller.banner = nil }
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                    if let notice = sharing.notice {
+                        CloudNoticeView(sharing: sharing, notice: notice)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
+                .padding(.top, 12)
+                .padding(.horizontal, 12)
             }
             .padding(.horizontal, 24)
             .padding(.top, 16)
             .animation(Theme.stateAnimation, value: controller.banner)
+            .animation(Theme.stateAnimation, value: sharing.notice)
 
             RecordBar(controller: controller)
                 .padding(.horizontal, 24)
@@ -163,16 +185,20 @@ private struct RecordBar: View {
     var body: some View {
         HStack(spacing: 16) {
             RecordButton(controller: controller)
+                .fixedSize()
             VStack(alignment: .leading, spacing: 2) {
                 Text(outputSummary)
                     .font(.system(size: 12, weight: .medium).monospacedDigit())
                     .foregroundStyle(Theme.primaryText)
-                Text("Saved to Movies › ScreenyPro")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.secondaryText)
+                    .lineLimit(1)
+                RecordBarSubtitle(sharing: controller.sharing)
             }
-            Spacer(minLength: 12)
-            MicLevelMeter(meter: controller.meter, deviceName: microphoneName)
+            .layoutPriority(1)
+            Spacer(minLength: 4)
+            HStack(spacing: 8) {
+                RecordingsButton(controller: controller, sharing: controller.sharing)
+                MicLevelMeter(meter: controller.meter, deviceName: microphoneName)
+            }
         }
     }
 
@@ -183,6 +209,27 @@ private struct RecordBar: View {
     private var microphoneName: String? {
         guard let id = controller.effectiveMicrophoneID else { return nil }
         return controller.microphones.first { $0.id == id }?.name
+    }
+}
+
+/// Opens the recent recordings list (share an older recording, copy its link).
+private struct RecordingsButton: View {
+    @ObservedObject var controller: RecorderController
+    @ObservedObject var sharing: CloudShareCenter
+
+    var body: some View {
+        Button {
+            sharing.isRecordingsShown.toggle()
+        } label: {
+            Image(systemName: "film.stack")
+                .font(.system(size: 13))
+        }
+        .buttonStyle(IconButtonStyle(size: 28))
+        .help("Recent Recordings")
+        .accessibilityLabel("Recent Recordings")
+        .popover(isPresented: $sharing.isRecordingsShown, arrowEdge: .top) {
+            RecordingsListView(sharing: sharing, library: controller.library)
+        }
     }
 }
 

@@ -91,6 +91,7 @@ public struct AppDependencies {
     public var makeRecorder: (RecordingConfig) -> Recording
     /// Must be called on the main thread.
     public var makePreviewView: () -> NSView & PreviewDisplaying
+    public var cloud: CloudUploading
 
     public init(
         makeScreenCapture: @escaping () -> ScreenCapturing,
@@ -98,8 +99,10 @@ public struct AppDependencies {
         system: SystemAccess,
         makePipeline: @escaping (LatestFrameBox, LatestFrameBox) -> RenderPipeline,
         makeRecorder: @escaping (RecordingConfig) -> Recording,
-        makePreviewView: @escaping () -> NSView & PreviewDisplaying
+        makePreviewView: @escaping () -> NSView & PreviewDisplaying,
+        cloud: CloudUploading
     ) {
+        self.cloud = cloud
         self.makeScreenCapture = makeScreenCapture
         self.makeCamera = makeCamera
         self.system = system

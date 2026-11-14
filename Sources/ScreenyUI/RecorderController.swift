@@ -65,6 +65,10 @@ final class RecorderController: ObservableObject {
 
     let meter = LevelMeterModel()
     let clock = ElapsedClock()
+    /// Cloud uploads and shares. A separate object, so upload progress never re-renders the recorder UI.
+    let sharing: CloudShareCenter
+    /// Recent recordings for the recordings list.
+    let library = RecordingsLibrary()
     let previewView: NSView & PreviewDisplaying
 
     /// Shows an alert (the app delegate decides between a sheet and a standalone alert).
@@ -109,7 +113,16 @@ final class RecorderController: ObservableObject {
         self.pipeline = dependencies.makePipeline(screen.frames, camera.frames)
         self.previewView = dependencies.makePreviewView()
         self.settings = SettingsStore.load()
+        self.sharing = CloudShareCenter(cloud: dependencies.cloud)
         wireCallbacks()
+        // The clipboard is left alone while a recording session runs (the user may be copying in the demo).
+        sharing.isCapturing = { [weak self] in
+            guard let self else { return false }
+            switch self.state {
+            case .countdown, .recording, .paused, .finishing: return true
+            case .idle, .finished: return false
+            }
+        }
     }
 
     private var system: SystemAccess { dependencies.system }
@@ -733,6 +746,8 @@ final class RecorderController: ObservableObject {
             return
         }
         banner = nil
+        sharing.notice = nil
+        sharing.isRecordingsShown = false
         state = .countdown(3)
         countdownTask = Task { [weak self] in
             for n in [3, 2, 1] {
@@ -868,7 +883,9 @@ final class RecorderController: ObservableObject {
     func trashFinished() {
         guard case .finished(let url) = state else { return }
         do {
+            sharing.cancelUpload(for: url)
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            sharing.pruneShares()
             state = .idle
         } catch {
             showAlert("Could not move the recording to the Trash", error.localizedDescription)
@@ -912,6 +929,10 @@ final class RecorderController: ObservableObject {
     }
 
     static var recordingsFolder: URL {
+        // Test harnesses point the app at a temporary folder instead of ~/Movies/ScreenyPro.
+        if let override = ProcessInfo.processInfo.environment["SCREENYPRO_RECORDINGS_FOLDER"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
         let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Movies")
         return movies.appendingPathComponent("ScreenyPro", isDirectory: true)
